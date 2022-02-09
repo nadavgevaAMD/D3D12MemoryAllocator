@@ -752,6 +752,8 @@ typedef enum ALLOCATION_FLAGS
     memory budget. Otherwise return `E_OUTOFMEMORY`.
     */
     ALLOCATION_FLAG_WITHIN_BUDGET = 0x4,
+
+    ALLOCATION_FLAG_RESERVED = 0x8,
 } ALLOCATION_FLAGS;
 
 /// \brief Parameters of created D3D12MA::Allocation object. To be used with Allocator::CreateResource.
@@ -893,6 +895,7 @@ private:
     {
         TYPE_COMMITTED,
         TYPE_PLACED,
+        TYPE_RESERVED,
         TYPE_HEAP,
         TYPE_COUNT
     };
@@ -915,6 +918,11 @@ private:
             UINT64 offset;
             NormalBlock* block;
         } m_Placed;
+
+        struct {
+            D3D12_HEAP_TYPE heapType;
+            Allocation*     backingHeap;
+        } m_Reserved;
 
         struct
         {
@@ -953,6 +961,7 @@ private:
     ~Allocation();
     void InitCommitted(D3D12_HEAP_TYPE heapType);
     void InitPlaced(UINT64 offset, UINT64 alignment, NormalBlock* block);
+    void InitReserved(D3D12_HEAP_TYPE heapType);
     void InitHeap(D3D12_HEAP_TYPE heapType, ID3D12Heap* heap);
     template<typename D3D12_RESOURCE_DESC_T>
     void SetResource(ID3D12Resource* resource, const D3D12_RESOURCE_DESC_T* pResourceDesc);

@@ -2559,6 +2559,9 @@ public:
     void FreePlacedMemory(Allocation* allocation);
     // Unregisters allocation from the collection of dedicated allocations and destroys associated heap.
     // Allocation object must be deleted externally afterwards.
+    void FreeReservedMemory(Allocation* allocation);
+    // Unregisters allocation from the collection of dedicated allocations and destroys associated heap.
+    // Allocation object must be deleted externally afterwards.
     void FreeHeapMemory(Allocation* allocation);
 
     void SetCurrentFrameIndex(UINT frameIndex);
@@ -2620,6 +2623,15 @@ private:
     UINT64 m_DefaultPoolTier1MinBytes[DEFAULT_POOL_MAX_COUNT]; // Default 0
     UINT64 m_DefaultPoolHeapTypeMinBytes[HEAP_TYPE_COUNT]; // Default UINT64_MAX, meaning not set
     D3D12MA_RW_MUTEX m_DefaultPoolMinBytesMutex;
+
+    HRESULT AllocateReservedResource(const ALLOCATION_DESC*                pAllocDesc,
+                                                           const D3D12_RESOURCE_DESC*            pResourceDesc,
+                                                           const D3D12_RESOURCE_ALLOCATION_INFO& resAllocInfo,
+                                                           D3D12_RESOURCE_STATES                 InitialResourceState,
+                                                           const D3D12_CLEAR_VALUE*              pOptimizedClearValue,
+                                                           Allocation**                          ppAllocation,
+                                                           REFIID                                riidResource,
+                                                           void**                                ppvResource);
 
     // Allocates and registers new committed resource with implicit heap, as dedicated allocation.
     // Creates and returns Allocation object.
@@ -4451,6 +4463,16 @@ HRESULT AllocatorPimpl::CreateResource(
                 ppAllocation,
                 riidResource,
                 ppvResource);
+        } else if ((finalAllocDesc.Flags & ALLOCATION_FLAG_RESERVED) != 0) {
+            return AllocateReservedResource(
+                &finalAllocDesc,
+                &finalResourceDesc,
+                resAllocInfo,
+                InitialResourceState,
+                pOptimizedClearValue,
+                ppAllocation,
+                riidResource,
+                ppvResource);
         }
         else
         {
@@ -4878,6 +4900,62 @@ bool AllocatorPimpl::PrefersCommittedAllocation(const D3D12_RESOURCE_DESC_T& res
 {
     // Intentional. It may change in the future.
     return false;
+}
+
+HRESULT AllocatorPimpl::AllocateReservedResource(const ALLOCATION_DESC*                pAllocDesc,
+                                                  const D3D12_RESOURCE_DESC*            pResourceDesc,
+                                                  const D3D12_RESOURCE_ALLOCATION_INFO& resAllocInfo,
+                                                  D3D12_RESOURCE_STATES                 InitialResourceState,
+                                                  const D3D12_CLEAR_VALUE*              pOptimizedClearValue,
+                                                  Allocation**                          ppAllocation,
+                                                  REFIID                                riidResource,
+                                                  void**                                ppvResource)
+{
+    if ((pAllocDesc->Flags & ALLOCATION_FLAG_NEVER_ALLOCATE) != 0) {
+        return E_OUTOFMEMORY;
+    }
+
+    if ((pAllocDesc->Flags & ALLOCATION_FLAG_WITHIN_BUDGET) != 0 &&
+        !NewAllocationWithinBudget(pAllocDesc->HeapType, resAllocInfo.SizeInBytes))
+    {
+        return E_OUTOFMEMORY;
+    }
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type                  = pAllocDesc->HeapType;
+
+    const D3D12_HEAP_FLAGS heapFlags = pAllocDesc->ExtraHeapFlags;
+
+    ID3D12Resource* res = NULL;
+    HRESULT         hr  = m_Device->CreateReservedResource(pResourceDesc, InitialResourceState, pOptimizedClearValue, IID_PPV_ARGS(&res));
+    if (SUCCEEDED(hr)) {
+        if (ppvResource != NULL) {
+            hr = res->QueryInterface(riidResource, ppvResource);
+        }
+        if (SUCCEEDED(hr)) {
+            const BOOL  wasZeroInitialized = FALSE;
+            Allocation* alloc =
+                m_AllocationObjectAllocator.Allocate(this, resAllocInfo.SizeInBytes, wasZeroInitialized);
+
+            alloc->InitReserved(pAllocDesc->HeapType);
+
+            // create backing heap for the reserved resource
+            Allocation* backingHeapAlloc;
+            AllocateHeap(pAllocDesc, resAllocInfo, &backingHeapAlloc);
+
+            alloc->m_Reserved.backingHeap = backingHeapAlloc;
+            alloc->SetResource(res, pResourceDesc);
+
+            *ppAllocation = alloc;
+
+            const UINT heapTypeIndex = HeapTypeToIndex(pAllocDesc->HeapType);
+            m_Budget.AddAllocation(heapTypeIndex, resAllocInfo.SizeInBytes);
+            m_Budget.m_BlockBytes[heapTypeIndex] += resAllocInfo.SizeInBytes;
+        } else {
+            res->Release();
+        }
+    }
+    return hr;
 }
 
 HRESULT AllocatorPimpl::AllocateCommittedResource(
@@ -5361,6 +5439,12 @@ void AllocatorPimpl::FreePlacedMemory(Allocation* allocation)
     blockVector->Free(allocation);
 }
 
+void AllocatorPimpl::FreeReservedMemory(Allocation* allocation)
+{
+    D3D12MA_ASSERT(allocation && allocation->m_PackedData.GetType() == Allocation::TYPE_RESERVED);
+    FreeHeapMemory(allocation->m_Reserved.backingHeap);
+}
+
 void AllocatorPimpl::FreeHeapMemory(Allocation* allocation)
 {
     D3D12MA_ASSERT(allocation && allocation->m_PackedData.GetType() == Allocation::TYPE_HEAP);
@@ -5833,7 +5917,7 @@ void AllocatorPimpl::WriteBudgetToJson(JsonWriter& json, const Budget& budget)
 void Allocation::PackedData::SetType(Type type)
 {
     const UINT u = (UINT)type;
-    D3D12MA_ASSERT(u < (1u << 2));
+    D3D12MA_ASSERT(u <= (1u << 2));
     m_Type = u;
 }
 
@@ -5877,6 +5961,9 @@ void Allocation::Release()
     case TYPE_PLACED:
         m_Allocator->FreePlacedMemory(this);
         break;
+    case TYPE_RESERVED:
+        m_Allocator->FreeReservedMemory(this);
+        break;
     case TYPE_HEAP:
         m_Allocator->FreeHeapMemory(this);
         break;
@@ -5910,6 +5997,8 @@ ID3D12Heap* Allocation::GetHeap() const
         return NULL;
     case TYPE_PLACED:
         return m_Placed.block->GetHeap();
+    case TYPE_RESERVED:
+        return m_Reserved.backingHeap->m_Heap.heap;
     case TYPE_HEAP:
         return m_Heap.heap;
     default:
@@ -5962,6 +6051,12 @@ void Allocation::InitPlaced(UINT64 offset, UINT64 alignment, NormalBlock* block)
     m_PackedData.SetType(TYPE_PLACED);
     m_Placed.offset = offset;
     m_Placed.block = block;
+}
+
+void Allocation::InitReserved(D3D12_HEAP_TYPE heapType)
+{
+    m_PackedData.SetType(TYPE_RESERVED);
+    m_Reserved.heapType = heapType;
 }
 
 void Allocation::InitHeap(D3D12_HEAP_TYPE heapType, ID3D12Heap* heap)
